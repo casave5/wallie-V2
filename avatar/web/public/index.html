@@ -1,0 +1,449 @@
+<!DOCTYPE html>
+<html lang="es">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width,initial-scale=1">
+<title>Casavita Live2D</title>
+<style>
+  html, body { margin: 0; padding: 0; height: 100%; background: transparent; overflow: hidden; }
+  #escena { position: fixed; inset: 0; width: 100%; height: 100%; display: block; }
+  body.fondo { background: #1b1d2a; }
+  #estado {
+    position: fixed; left: 10px; bottom: 10px; z-index: 10;
+    font: 13px/1.5 ui-monospace, Menlo, Consolas, monospace;
+    color: #e8f0ff; background: rgba(10, 12, 20, .72);
+    padding: 8px 12px; border-radius: 8px; white-space: pre; pointer-events: none;
+  }
+  #estado.oculto { display: none; }
+  #aviso {
+    position: fixed; inset: 0; z-index: 20; display: none;
+    align-items: center; justify-content: center; text-align: center;
+    font: 16px/1.6 system-ui, sans-serif; color: #ffd7d7;
+    background: rgba(60, 10, 20, .92); padding: 24px; white-space: pre-wrap;
+  }
+</style>
+</head>
+<body>
+<canvas id="escena"></canvas>
+<div id="estado" class="oculto"></div>
+<div id="aviso"></div>
+
+<script src="/pixi.min.js"></script>
+<script src="/live2dcubismcore4.min.js"></script>
+<script src="/cubism.min.js"></script>
+<script>
+(async function arrancar() {
+  const consulta = new URLSearchParams(location.search);
+  const NOMBRE = consulta.get('modelo') || 'koharu';
+  const MOSTRAR_ESTADO = consulta.get('estado') === '1';
+  const FONDO = consulta.get('fondo') === '1';
+  const PROBAR = consulta.get('probar') || '';
+  const ESCALA = parseFloat(consulta.get('escala') || '0.3');
+  const POS_X = parseFloat(consulta.get('x') || '0.94');
+  const POS_Y = parseFloat(consulta.get('y') || '0.86');
+  const ESPERA = Math.min(parseInt(consulta.get('espera') || '0', 10) || 0, 30000);
+
+  function reportar(etiqueta, texto) {
+    try {
+      fetch('/api/log', {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ etiqueta, texto: String(texto) }),
+      }).catch(() => {});
+    } catch (e) { }
+  }
+  window.addEventListener('error', (e) =>
+    reportar('error',
+      `${e.message} @ ${e.filename || '?'}:${e.lineno || '?'}\n${(e.error && e.error.stack) || ''}`));
+  window.addEventListener('unhandledrejection', (e) =>
+    reportar('promesa', (e.reason && (e.reason.stack || e.reason.message)) || e.reason));
+
+  if (ESPERA > 0) {
+    const retenedor = new Image();
+    retenedor.src = `/api/retraso?ms=${ESPERA}`;
+    retenedor.style.display = 'none';
+    document.body.appendChild(retenedor);
+  }
+
+  const cajaEstado = document.getElementById('estado');
+  const aviso = document.getElementById('aviso');
+  if (FONDO) document.body.classList.add('fondo');
+  if (MOSTRAR_ESTADO) cajaEstado.classList.remove('oculto');
+
+  function mostrarAviso(texto) {
+    aviso.style.display = 'flex';
+    aviso.textContent = texto;
+    reportar('aviso', texto.replace(/\s+/g, ' ').slice(0, 200));
+  }
+
+  const prueba = document.createElement('canvas');
+  const gl = prueba.getContext('webgl2') || prueba.getContext('webgl');
+  reportar('webgl', gl
+    ? `${gl.getParameter(gl.VERSION)} | ${gl.getParameter(gl.RENDERER)}`
+    : 'SIN WEBGL');
+
+  if (!window.PIXI || !PIXI.live2d || !PIXI.live2d.Live2DModel) {
+    mostrarAviso('No se cargó pixi-live2d-display.\nRevisa que /cubism.min.js exista.');
+    return;
+  }
+
+  function esperarCore(limiteMs = 20000) {
+    return new Promise((resolver, rechazar) => {
+      const t0 = Date.now();
+      (function mirar() {
+        const c = window.Live2DCubismCore;
+        if (c && c.Moc && c.Model) return resolver(c);
+        if (Date.now() - t0 > limiteMs) {
+          return rechazar(new Error(
+            'El motor Cubism no arrancó.\nExporta: ' + (c ? Object.keys(c).join(', ') : 'nada')));
+        }
+        setTimeout(mirar, 50);
+      })();
+    });
+  }
+
+  try {
+    const core = await esperarCore();
+    reportar('core', `listo, moc v${core.Version.csmGetLatestMocVersion()}`);
+  } catch (e) {
+    mostrarAviso(e.message);
+    return;
+  }
+
+  const { Live2DModel } = PIXI.live2d;
+
+  const app = new PIXI.Application({
+    view: document.getElementById('escena'),
+    backgroundAlpha: 0,
+    resizeTo: window,
+    antialias: true,
+    autoDensity: true,
+    resolution: Math.min(window.devicePixelRatio || 1, 2),
+    autoStart: true,
+  });
+  reportar('pixi', `listo v${PIXI.VERSION} tipo=${app.renderer.type}`);
+
+  async function cargar(nombre) {
+    const parcheado = `/model/${nombre}/runtime/${nombre}.casavita.model3.json`;
+    const original = `/model/${nombre}/runtime/${nombre}.model3.json`;
+    try {
+      return { modelo: await Live2DModel.from(parcheado), ruta: parcheado };
+    } catch (e1) {
+      reportar('aviso', `el parcheado fallo (${e1.message}), pruebo el original`);
+      return { modelo: await Live2DModel.from(original), ruta: original };
+    }
+  }
+
+  let modelo;
+  try {
+    const carga = await cargar(NOMBRE);
+    modelo = carga.modelo;
+    reportar('modelo', `cargado ${NOMBRE} desde ${carga.ruta}`);
+  } catch (e) {
+    mostrarAviso('No se pudo cargar el modelo "' + NOMBRE + '".\n\n' + e);
+    reportar('error', 'carga: ' + (e && e.stack ? e.stack : e));
+    return;
+  }
+
+  function compat(cdm) {
+    const crudo = cdm._model || cdm;
+    const d = crudo.drawables;
+    const hecho = [];
+    if (d && d.renderOrders === undefined && crudo.renderOrders !== undefined) {
+      d.renderOrders = crudo.renderOrders;
+      hecho.push('drawables.renderOrders');
+    }
+    if (d && d.dynamicFlags && d.dynamicFlags.resetDynamicFlags === undefined) {
+      d.dynamicFlags.resetDynamicFlags = () => {
+        for (let i = 0; i < d.count; i++) d.dynamicFlags[i] = d.constantFlags[i];
+      };
+      hecho.push('resetDynamicFlags');
+    }
+    return hecho;
+  }
+  const ajustes = compat(modelo.internalModel.coreModel);
+  reportar('shim', ajustes.length ? ajustes.join(' | ') : 'no hizo falta');
+
+  app.stage.addChild(modelo);
+  modelo.anchor.set(0.5, 0.5);
+  modelo.scale.set(1);
+
+  const natural = { ancho: modelo.width || 1, alto: modelo.height || 1 };
+  modelo.position.set(0, 0);
+
+  // El modelo de pixi-live2d-display se ancla por su CENTRO, asi que la
+  // posicion es el centro del cuerpo, no la base. Durante el saludo el brazo
+  // sube por encima de la cabeza y se saldria de la ventana: por eso el
+  // avatar aleja un poco la camara mientras dura el gesto.
+  let zoomGesto = 1;
+  const ZOOM_SALUDO = 0.9;
+
+  // Valores ajustables en vivo con el teclado (para colocar el avatar a ojo).
+  const ajuste = { escala: ESCALA, x: POS_X, y: POS_Y };
+
+// Puente para la ventana de escritorio (overlay.py): le dice el tamaño
+  // natural del modelo y el tamaño real del canvas, para poder ceñir la
+  // ventana al avatar en vez de dejar un rectángulo grande de zonas vacias.
+  window.__casavita = {
+    natural: () => ({ ancho: natural.ancho, alto: natural.alto }),
+    canvas: () => ({
+      ancho: app.renderer.width / app.renderer.resolution,
+      alto: app.renderer.height / app.renderer.resolution,
+    }),
+  };
+
+  function colocar() {
+    const ancho = app.renderer.width / app.renderer.resolution;
+    const alto = app.renderer.height / app.renderer.resolution;
+    if (!ancho || !alto) return;
+    const escala = Math.min(ancho / natural.ancho, alto / natural.alto) * ajuste.escala * zoomGesto;
+    modelo.scale.set(escala);
+    modelo.position.set(ancho * ajuste.x, alto * ajuste.y);
+  }
+
+  function pintarAjuste() {
+    cajaAjuste.textContent =
+      `escala ${ajuste.escala.toFixed(2)}\n` +
+      `x ${ajuste.x.toFixed(2)}   y ${ajuste.y.toFixed(2)}\n` +
+      `flechas mover  +/- tamano  0 reset`;
+  }
+
+  // Panel de ajuste: solo si se pide con ?ajuste=1, para no ensuciar el stream.
+  const cajaAjuste = document.createElement('div');
+  cajaAjuste.style.cssText = 'position:fixed;right:10px;top:10px;z-index:20;font:12px/1.5 ui-monospace,monospace;color:#e8f0ff;background:rgba(10,12,20,.8);padding:6px 9px;border-radius:8px;pointer-events:none;white-space:pre;';
+  if (consulta.get('ajuste') === '1') {
+    document.body.appendChild(cajaAjuste);
+    pintarAjuste();
+  }
+  const PASO_MOV = 0.02, PASO_SUM = 0.05;
+  addEventListener('keydown', (ev) => {
+    if (ev.target && /^(INPUT|TEXTAREA)$/.test(ev.target.tagName)) return;
+    let usado = true;
+    switch (ev.key) {
+      case 'ArrowLeft':  ajuste.x -= PASO_MOV; break;
+      case 'ArrowRight': ajuste.x += PASO_MOV; break;
+      case 'ArrowUp':    ajuste.y -= PASO_MOV; break;
+      case 'ArrowDown':  ajuste.y += PASO_MOV; break;
+      case '+': case '=': ajuste.escala += PASO_SUM; break;
+      case '-': case '_': ajuste.escala = Math.max(0.05, ajuste.escala - PASO_SUM); break;
+      case '0': ajuste.escala = ESCALA; ajuste.x = POS_X; ajuste.y = POS_Y; break;
+      default: usado = false;
+    }
+    if (!usado) return;
+    ev.preventDefault();
+    colocar();
+    pintarAjuste();
+  });
+  function recolocar() {
+    // El renderer puede quedarse con el tamano del primer frame; forzamos
+    // a sincronizar con el contenedor antes de escalar el modelo.
+    const caja = document.getElementById('escena');
+    const ancho = caja.clientWidth || window.innerWidth;
+    const alto = caja.clientHeight || window.innerHeight;
+    if (app.renderer.width !== ancho * app.renderer.resolution ||
+        app.renderer.height !== alto * app.renderer.resolution) {
+      app.renderer.resize(ancho, alto);
+    }
+    colocar();
+  }
+  recolocar();
+  window.addEventListener('resize', recolocar);
+  // Primerasزامنizaciones: el canvas suele medirse antes de que el layout asiente.
+  for (const ms of [0, 100, 300, 700, 1500]) setTimeout(recolocar, ms);
+  if (window.ResizeObserver) {
+    new ResizeObserver(() => recolocar()).observe(document.getElementById('escena'));
+  }
+
+  const nucleo = modelo.internalModel.coreModel;
+  const objetivos = {};
+  const valores = {};
+  const recibidoEn = {};
+  const desconocidas = new Set();
+  const activos = new Set();
+
+  function definir(parametro, valor) {
+    if (nucleo.getParameterIndex(parametro) < 0) {
+      desconocidas.add(parametro);
+      return;
+    }
+    objetivos[parametro] = valor;
+    activos.add(parametro);
+  }
+
+  try { modelo.motion('Idle'); } catch (e) { }
+
+  function aplicarParametros() {
+    for (const [parametro, valor] of Object.entries(valores)) {
+      if (activos.has(parametro)) nucleo.setParameterValueById(parametro, valor);
+    }
+  }
+  modelo.internalModel.on('beforeModelUpdate', aplicarParametros);
+
+  let parpadeoHasta = 0;
+  let proximoParpadeo = 1500 + Math.random() * 2500;
+  let ultimoPulso = 0;
+  const MARGEN_REMOTO = 600;
+  let ultimoSaludo = 0;
+  const MIN_SALUDO_MS = 1200;
+  // Saludo: 3 fases (subir, agitar, bajar) sobre los mismos parametros que la boca
+  let saludoHasta = 0;
+  const DURACION_SALUDO = 1900;
+  const REPOSO = { PARAM_ARM_R_01: 1, PARAM_ARM_R_02: -3, PARAM_ARM_R_03: 10 };
+  const ARRIBA = { PARAM_ARM_R_01: 6, PARAM_ARM_R_02: 12, PARAM_ARM_R_03: 20 };
+  const MUÑECA = { centro: -0.28, radio: 1.0 };
+  const OSCILACIONES = 3;
+
+  // 30 fps es suficiente para un avatar y deja CPU libre para el audio,
+  // que se entrecorta si el render WebGL satura el procesador.
+  app.ticker.maxFPS = parseFloat(consulta.get('fps') || '30');
+
+  app.ticker.add(() => {
+    const ahora = performance.now();
+    const paso = Math.min(app.ticker.deltaMS || 16.667, 50) / 16.667;
+
+    if (PROBAR === 'boca') {
+      const ciclo = 2000;
+      const valor = (ahora % ciclo) / ciclo;
+      objetivos.PARAM_MOUTH_OPEN_Y = valor < 0.5 ? valor * 2 : (1 - valor) * 2;
+      objetivos.PARAM_MOUTH_FORM = Math.sin(valor * Math.PI * 2) * 0.4;
+      activos.add('PARAM_MOUTH_OPEN_Y');
+      activos.add('PARAM_MOUTH_FORM');
+    }
+
+    if (ahora < saludoHasta) {
+      const fase = 1 - (saludoHasta - ahora) / DURACION_SALUDO;
+      // 0.00-0.20 subir, 0.20-0.75 agitar, 0.75-1.00 bajar
+      let mezcla;
+      if (fase < 0.2) mezcla = fase / 0.2;
+      else if (fase < 0.75) mezcla = 1;
+      else mezcla = Math.max(0, 1 - (fase - 0.75) / 0.25);
+      // Zoom out suave mientras el brazo esta arriba (hueco para la mano).
+      zoomGesto += (ZOOM_SALUDO - zoomGesto) * Math.min(1, 0.14 * paso);
+      colocar();
+      for (const [parametro, arriba] of Object.entries(ARRIBA)) {
+        objetivos[parametro] = REPOSO[parametro] + (arriba - REPOSO[parametro]) * mezcla;
+        activos.add(parametro);
+      }
+      const vaiven = Math.sin((fase - 0.2) / 0.55 * Math.PI * 2 * OSCILACIONES);
+      objetivos.PARAM_ARM_R = 1;
+      objetivos.PARAM_HAND_R = MUÑECA.centro + MUÑECA.radio * vaiven * mezcla;
+      objetivos.PARAM_HAND_SWITCH_R = 2;
+      activos.add('PARAM_ARM_R');
+      activos.add('PARAM_HAND_R');
+      activos.add('PARAM_HAND_SWITCH_R');
+    } else if (saludoHasta > 0 && ahora >= saludoHasta) {
+      // el saludo termino: devolver los brazos al Idle y soltarlos
+      const soltar = (parametro, valor) => {
+        objetivos[parametro] = valor;
+        valores[parametro] = valor;
+        activos.delete(parametro);
+      };
+      for (const parametro of Object.keys(ARRIBA)) soltar(parametro, REPOSO[parametro]);
+      soltar('PARAM_ARM_R', 1);
+      soltar('PARAM_HAND_R', MUÑECA.centro);
+      soltar('PARAM_HAND_SWITCH_R', 2);
+      saludoHasta = 0;
+      // Volver al tamano normal.
+      zoomGesto = 1;
+      colocar();
+    }
+
+    if (ahora > proximoParpadeo) {
+      parpadeoHasta = ahora + 130;
+      proximoParpadeo = ahora + 1800 + Math.random() * 3600;
+    }
+    const cierre = ahora < parpadeoHasta ? 0 : 1;
+    if (ahora - (recibidoEn.PARAM_EYE_L_OPEN || 0) > MARGEN_REMOTO) {
+      objetivos.PARAM_EYE_L_OPEN = cierre;
+      activos.add('PARAM_EYE_L_OPEN');
+    }
+    if (ahora - (recibidoEn.PARAM_EYE_R_OPEN || 0) > MARGEN_REMOTO) {
+      objetivos.PARAM_EYE_R_OPEN = cierre;
+      activos.add('PARAM_EYE_R_OPEN');
+    }
+
+    for (const [parametro, destino] of Object.entries(objetivos)) {
+      const actual = valores[parametro] === undefined ? destino : valores[parametro];
+      const siguiente = actual + (destino - actual) * Math.min(1, 0.28 * paso);
+      valores[parametro] = siguiente;
+    }
+
+    if (MOSTRAR_ESTADO && ahora - ultimoPulso > 250) {
+      ultimoPulso = ahora;
+      cajaEstado.textContent =
+        `modelo   ${NOMBRE}\n` +
+        `boca     ${(valores.PARAM_MOUTH_OPEN_Y || 0).toFixed(3)}\n` +
+        `ojos     ${(valores.PARAM_EYE_L_OPEN || 0).toFixed(2)}\n` +
+        `ws       ${conectado ? 'conectado' : 'sin conexion'}\n` +
+        `fps      ${Math.round(app.ticker.FPS)}`;
+    }
+  });
+
+  setTimeout(() => {
+    try {
+      const cdm = nucleo;
+      const crudo = cdm._model || cdm;
+      const d = crudo.drawables;
+      reportar('malla', JSON.stringify({
+        drawables: d.count,
+        texturas: Array.isArray(modelo.textures) ? modelo.textures.length : 'n/d',
+        bound: [Math.round(modelo.getBounds().x), Math.round(modelo.getBounds().y),
+          Math.round(modelo.getBounds().width), Math.round(modelo.getBounds().height)],
+        escala: Number(modelo.scale.x.toFixed(4)),
+      }));
+    } catch (e) {
+      reportar('malla', 'fallo: ' + e.message);
+    }
+  }, 2500);
+
+  let conectado = false;
+  function conectar() {
+    const ws = new WebSocket(`ws://${location.host}/ws`);
+    ws.onopen = () => {
+      conectado = true;
+      ws.send(JSON.stringify({ tipo: 'hola', rol: 'visor', modelo: NOMBRE }));
+    };
+    ws.onclose = () => {
+      conectado = false;
+      setTimeout(conectar, 1500);
+    };
+    ws.onerror = () => ws.close();
+    ws.onmessage = (evento) => {
+      let mensaje;
+      try { mensaje = JSON.parse(evento.data); } catch { return; }
+      if (mensaje.tipo === 'gesto') {
+        if ((mensaje.gesto === 'saludo' || mensaje.gesto === 'ola') &&
+            performance.now() - ultimoSaludo > MIN_SALUDO_MS) {
+          ultimoSaludo = performance.now();
+          saludoHasta = ultimoSaludo + DURACION_SALUDO;
+        }
+        return;
+      }
+      if (mensaje.tipo !== 'params' || !mensaje.params) return;
+      for (const [parametro, valor] of Object.entries(mensaje.params)) {
+        recibidoEn[parametro] = performance.now();
+        definir(parametro, valor);
+      }
+    };
+  }
+  conectar();
+
+  document.addEventListener('pointerdown', (evento) => {
+    const x = evento.offsetX;
+    const y = evento.offsetY;
+    if (modelo.hitTest(x, y)) modelo.motion('Tap');
+    else modelo.focus(x, y);
+  });
+
+  window.diagnostico = () => ({
+    modelo: NOMBRE,
+    fps: Math.round(app.ticker.FPS),
+    escala: modelo.scale.x,
+    conectados: conectado,
+    desconocidas: [...desconocidas],
+    objetivos: { ...objetivos },
+  });
+})();
+</script>
+</body>
+</html>

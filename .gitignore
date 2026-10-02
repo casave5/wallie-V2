@@ -66,3 +66,6 @@ control/navigator.py
 control/pathfinder.py
 control/perception.py
 control/tracker.py
+
+# Node (avatar/web motor de render)
+node_modules/

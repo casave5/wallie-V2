@@ -2,9 +2,11 @@
 from __future__ import annotations
 
 import asyncio
+import os
 import threading
 import time
 from collections import deque
+from pathlib import Path
 from typing import Optional
 
 import numpy as np
@@ -66,6 +68,8 @@ class AudioPlayer:
         self._stream: Optional[sd.RawOutputStream] = None
         self._loop: Optional[asyncio.AbstractEventLoop] = None
         self._last_write_ts: float = 0.0  # when audio was last queued (for hearing self-mute)
+        self._underruns: int = 0
+        self._underflow_rt: int = 0
 
     # ----- lifecycle -----
     def start(self) -> None:
@@ -98,6 +102,49 @@ class AudioPlayer:
         self._stream.start()
         logger.info(f"audio: playing at {self._sr} Hz, {self._channels}ch, block={self._blocksize}"
                     f"{' (WASAPI auto-convert)' if extra else ''}")
+        self._prioridad_tiempo_real()
+
+    # ----- prioridad de tiempo real -----
+    def _prioridad_tiempo_real(self, prioridad: int = 20) -> None:
+        """Sube a SCHED_FIFO los hilos del stream de audio.
+
+        El callback de PortAudio corre en un hilo propio (no es un hilo de
+        Python) que, con prioridad normal, se retrasa cuando la CPU se llena y
+        el audio sale entrecortado. Con tiempo real el hilo se ejecuta a tiempo.
+        """
+        objetivo = prioridad
+        subidos = 0
+        for tid, comm in self._hilos_de_audio():
+            try:
+                if (os.sched_getscheduler(tid) == os.SCHED_FIFO
+                        and os.sched_getparam(tid).sched_priority >= objetivo):
+                    continue
+                os.sched_setscheduler(tid, os.SCHED_FIFO, os.sched_param(objetivo))
+                subidos += 1
+                logger.info(f"audio: hilo {tid} ({comm}) a SCHED_FIFO prio {objetivo}")
+            except Exception:  # noqa: BLE001 — sin permisos o hilo ya muerto
+                continue
+        if not subidos:
+            logger.info("audio: no se pudo aplicar prioridad RT a los hilos de audio")
+
+    @staticmethod
+    def _hilos_de_audio() -> list[tuple[int, str]]:
+        """Localiza los hilos nativos del stream por nombre en /proc/self/task."""
+        encontrado: list[tuple[int, str]] = []
+        try:
+            base = Path("/proc/self/task")
+            for tarea in base.iterdir():
+                if not tarea.name.isdigit():
+                    continue
+                try:
+                    comm = (tarea / "comm").read_text().strip()
+                except OSError:
+                    continue
+                if "PortAudio" in comm or "portaudio" in comm.lower():
+                    encontrado.append((int(tarea.name), comm))
+        except OSError:
+            return []
+        return encontrado
 
     def close(self) -> None:
         if self._stream is not None:
@@ -168,7 +215,8 @@ class AudioPlayer:
     # ----- audio callback -----
     def _callback(self, outdata, frames: int, time_info, status) -> None:  # noqa: ARG002
         if status:
-            logger.debug(f"audio status: {status}")
+            self._underflow_rt += 1
+            logger.warning(f"audio status (UNDERFLOW real #{self._underflow_rt}): {status}")
         needed = frames * self._channels * 2
         with self._lock:
             available = len(self._buf)
@@ -180,6 +228,14 @@ class AudioPlayer:
                 chunk = b""
             empty_after = len(self._buf) == 0
 
+        if take < needed and (time.time() - self._last_write_ts) < 0.5:
+            # Búfer vacío justo tras escribir audio = ayuno real (se oye un corte).
+            # Durante silencio normal el búfer también está vacío, pero no es un fallo.
+            self._underruns += 1
+            logger.warning(
+                f"audio: underrun #{self._underruns} (faltaron {needed - take} bytes, "
+                f"quedaban {available})"
+            )
         if take < needed:
             chunk = chunk + b"\x00" * (needed - take)
         outdata[: len(chunk)] = chunk

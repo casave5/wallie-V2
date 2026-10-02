@@ -136,6 +136,9 @@ class LLMConfig(BaseModel):
     presence_penalty: float = 0.3
     frequency_penalty: float = 0.4
     vision_capable: bool = False
+    # Reasoning models (gpt-oss on Groq) hide a reasoning pass that eats max_tokens
+    # and latency. "low" keeps a live stream snappy; "" sends nothing.
+    reasoning_effort: str = ""
     allow_vision_skip: bool = True
     ollama_base_url: str = "http://localhost:11434"
     ollama_keep_alive: str = "5m"
@@ -148,6 +151,10 @@ class TTSConfig(BaseModel):
     # Output device for Wallie's voice. "" = system default. Accepts a device index
     # or a name substring, e.g. "CABLE Input" to route TTS into VRChat via VB-CABLE.
     output_device: str = ""
+    # Buffer del reproductor en muestras. Mas grande = mas margen para que el
+    # hilo de audio llegue a tiempo (suena sin cortes) a cambio de latencia.
+    # 4096 a 48 kHz son ~85 ms. 0 = usar el valor por defecto del reproductor.
+    blocksize: int = 4096
     el_model_id: str = "eleven_turbo_v2_5"
     el_stability: float = 0.45
     el_similarity_boost: float = 0.75
@@ -158,6 +165,12 @@ class TTSConfig(BaseModel):
     fish_chunk_length: int = 100
     piper_model_path: str = ""
     piper_length_scale: float = 1.0
+    # Optional ffmpeg -af chain applied to Piper output (Casavita's anime voice).
+    # Empty = raw Piper. See tts/piper.py for the preset used by the profile.
+    piper_postprocess: str = ""
+    # Run Piper on the GPU (needs onnxruntime-gpu + CUDA libs). ~15x faster than
+    # CPU on this laptop; automatically falls back to CPU if CUDA is missing.
+    piper_use_cuda: bool = True
     # Kokoro — local, high-quality neural TTS (free, runs on CPU/GPU). voice e.g.
     # af_heart / am_adam / bf_emma; lang_code 'a'=US English, 'b'=UK. speed 0.5-2.0.
     kokoro_voice: str = "af_heart"
@@ -200,6 +213,11 @@ class VisionConfig(BaseModel):
     # Scales the "fill the silence" fallback timer. >1 waits longer before narrating
     # into quiet stretches (less ambient chatter); <1 fills dead air sooner.
     silence_fallback_scale: float = 1.0
+    # When False, Wallie NEVER starts a turn on her own. She only speaks when the
+    # viewer writes in chat, the owner talks to her, or she is explicitly addressed.
+    # Vision still runs (for reactions) but the "silence got too long → narrate"
+    # fallbacks stay parked.
+    spontaneous_monologue: bool = True
     # How strongly the app_switch/media "active content" reaction boost applies.
     # 1.0 = full boost (right for browsing, where switching apps is a real event).
     # Lower it for FULLSCREEN GAMES, where every camera move looks like an app_switch
@@ -233,6 +251,26 @@ class HearingConfig(BaseModel):
     beam_size: int = 5                   # Whisper beam width (higher = more accurate on accents/noise)
     denoise: bool = False                # spectral noise reduction before STT (needs `noisereduce`)
 
+    # --- Microphone source ---
+    # PipeWire source name to record. "" = follow the system default input, so if the
+    # streamer switches headset/mic in the mixer, Casavita follows automatically.
+    # Set an explicit name (e.g. the Razer headset's source) to pin it.
+    device: str = ""
+    # --- Push-to-talk: only listen when asked ---
+    # Always-on hearing makes her butt into every aside. With this on she keeps her ear
+    # shut until she is called, then listens until the conversation goes quiet.
+    push_to_talk: bool = True
+    # Wake words that open her ear (lowercase, matched anywhere in the heard text).
+    wake_words: list[str] = ["casavita", "casa vita"]
+    # How long the ear stays open after a wake word before it closes again (seconds).
+    listen_timeout_sec: float = 25.0
+    # Close the ear this many seconds after the streamer stops talking (0 = never).
+    close_after_silence_sec: float = 8.0
+    # Ignore the beginning of the utterance so she doesn't answer her own wake word.
+    wake_guard_sec: float = 1.2
+    # While the ear is open, also react to plain speech (not just the wake word).
+    answer_all_when_open: bool = True
+
 
 class ChatConfig(BaseModel):
     youtube_enabled: bool = False
@@ -241,6 +279,16 @@ class ChatConfig(BaseModel):
     reply_probability: float = 0.35
     min_reply_interval_sec: float = 8.0
     max_message_age_sec: float = 45.0
+    # Users who ALWAYS get an answer, no dice roll and no cooldown. Case-insensitive,
+    # without the leading '@'. This is the streamer talking to her in their own chat.
+    always_reply_usernames: list[str] = []
+    # Light roasting is on/off. When on, she is allowed one friendly jab per reply,
+    # aimed at chat AND at casave himself.
+    banter: bool = True
+    # How often she pings casave with a question ("¿qué haces ahora?") when the chat
+    # is quiet. 0.0 = never ask on her own. Independent of spontaneous_monologue.
+    check_in_probability: float = 0.0
+    check_in_min_idle_sec: float = 300.0
 
 
 class TopicConfig(BaseModel):
@@ -299,6 +347,8 @@ class OrchestratorConfig(BaseModel):
 
 class AvatarConfig(BaseModel):
     enabled: bool = False
+    backend: str = "vts"              # "vts" or "web"
+    web_url: str = "http://127.0.0.1:8100"
     vts_host: str = "127.0.0.1"
     vts_port: int = 8001
 

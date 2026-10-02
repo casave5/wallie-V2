@@ -2,6 +2,7 @@
 from __future__ import annotations
 
 import asyncio
+import logging
 import sys
 from typing import Optional
 
@@ -16,9 +17,28 @@ from llm import build_provider
 from tts import build_tts
 
 
+class _LoguruBridge(logging.Handler):
+    """Manda los logs del modulo `logging` estándar (hearing.capture) a loguru.
+
+    Sin esto, esos mensajes se pierden: loguru y logging son sistemas
+    distintos, y el "last resort" del logging solo enseña WARNING. Por eso
+    durante horas no aparecia ni un INFO del micro y costaba adivinar.
+    """
+
+    def emit(self, record: logging.LogRecord) -> None:
+        try:
+            level = logger.level(record.levelname).name
+        except ValueError:
+            level = record.levelno
+        logger.opt(depth=6, exception=record.exc_info).log(level, record.getMessage())
+
+
 def _configure_logger(level: str) -> None:
     logger.remove()
     logger.add(sys.stderr, level=level, enqueue=True, backtrace=False, diagnose=False)
+    root = logging.getLogger()
+    root.handlers[:] = [_LoguruBridge()]
+    root.setLevel(logging.DEBUG)
 
 
 def build_orchestrator(runtime: Optional[Runtime] = None) -> Orchestrator:
@@ -31,6 +51,7 @@ def build_orchestrator(runtime: Optional[Runtime] = None) -> Orchestrator:
     llm = build_provider(cfg.llm, runtime.secrets)
     tts = build_tts(cfg.tts, runtime.secrets)
     player = AudioPlayer(sample_rate=tts.sample_rate, channels=tts.channels,
+                         blocksize=int(getattr(cfg.tts, "blocksize", 0) or 4096),
                          device=(cfg.tts.output_device or None))
 
     chat_manager: Optional[ChatManager] = None
@@ -75,17 +96,23 @@ def build_orchestrator(runtime: Optional[Runtime] = None) -> Orchestrator:
                 cfg.hearing, hearing_queue,
                 is_self_speaking=lambda: player.speaking_recently(self_mute_window),
             )
-            logger.info("hearing: enabled (system-audio loopback + STT, self-muted while speaking)")
+            logger.info("hearing: enabled (microphone + STT, self-muted while speaking)")
 
     avatar = None
     if cfg.avatar.enabled:
         try:
-            from avatar import VTubeStudioAvatar
-            avatar = VTubeStudioAvatar(cfg.avatar)
-            asyncio.create_task(avatar.connect(), name="vts-avatar")
-            logger.info(f"avatar: VTube Studio enabled ({cfg.avatar.vts_host}:{cfg.avatar.vts_port})")
+            if cfg.avatar.backend == "web":
+                from avatar import WebAvatar
+                avatar = WebAvatar(cfg.avatar)
+                asyncio.create_task(avatar.connect(), name="web-avatar")
+                logger.info(f"avatar: Live2D web habilitado ({cfg.avatar.web_url})")
+            else:
+                from avatar import VTubeStudioAvatar
+                avatar = VTubeStudioAvatar(cfg.avatar)
+                asyncio.create_task(avatar.connect(), name="vts-avatar")
+                logger.info(f"avatar: VTube Studio enabled ({cfg.avatar.vts_host}:{cfg.avatar.vts_port})")
         except Exception as e:
-            logger.error(f"avatar: failed to start VTS client: {e}")
+            logger.error(f"avatar: failed to start client: {e}")
 
     profile_name = cfg.profile_name or "default"
     memory_path = PROFILES_DIR / f"{profile_name}.memory.json"

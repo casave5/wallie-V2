@@ -6,7 +6,7 @@ import time
 from dataclasses import dataclass, field
 from typing import Literal, Protocol
 
-Platform = Literal["youtube", "twitch", "kick"]
+Platform = Literal["youtube", "twitch", "kick", "tiktok"]
 
 
 @dataclass

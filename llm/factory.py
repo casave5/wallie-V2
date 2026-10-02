@@ -36,6 +36,7 @@ def build_provider(cfg: LLMConfig, secrets: Secrets) -> LLMProvider:
                 api_key=secrets.groq_api_key,
                 base_url="https://api.groq.com/openai/v1",
                 supports_vision=cfg.vision_capable,
+                reasoning_effort=cfg.reasoning_effort,
             )
         return OpenAICompatProvider(
             name="openrouter",

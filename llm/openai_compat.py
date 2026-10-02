@@ -29,6 +29,7 @@ class OpenAICompatProvider(LLMProvider):
         supports_vision: bool = False,
         extra_headers: dict[str, str] | None = None,
         timeout: float = _REQUEST_TIMEOUT_SEC,
+        reasoning_effort: str = "",
     ) -> None:
         if not api_key:
             raise LLMError(f"{name}: missing API key")
@@ -40,6 +41,9 @@ class OpenAICompatProvider(LLMProvider):
         # field, so only enable it for OpenRouter. Caching the big static system
         # prompt removes it from prefill on repeat calls → lower latency, same quality.
         self._supports_cache = name == "openrouter"
+        # Reasoning models (gpt-oss) spend max_tokens on hidden reasoning before the
+        # answer. "low" keeps them snappy for a live stream; "" leaves it untouched.
+        self._reasoning_effort = reasoning_effort or None
         self._base_url = base_url
         self._client = AsyncOpenAI(
             api_key=api_key,
@@ -60,6 +64,9 @@ class OpenAICompatProvider(LLMProvider):
         frequency_penalty: float = 0.0,
     ) -> AsyncIterator[str]:
         payload = [self._encode_message(m) for m in messages]
+        extra_body = (
+            {"reasoning_effort": self._reasoning_effort} if self._reasoning_effort else None
+        )
         last_err: Exception | None = None
         for attempt in range(_MAX_ATTEMPTS):
             produced = False
@@ -72,6 +79,7 @@ class OpenAICompatProvider(LLMProvider):
                     max_tokens=max_tokens,
                     presence_penalty=presence_penalty,
                     frequency_penalty=frequency_penalty,
+                    extra_body=extra_body,
                     stream=True,
                 )
                 async for event in stream:

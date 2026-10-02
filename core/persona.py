@@ -445,7 +445,27 @@ class Persona:
         topic_drift_style: str = "natural",
         after_vision: bool = False,
         heard: str = "",
+        check_in: bool = False,
+        owner_recent: Optional[list[str]] = None,
+        chat_banter: bool = True,
     ) -> str:
+        if check_in:
+            extra = ""
+            if owner_recent:
+                extra = ("Lo último que dijo casave fue: "
+                         + " / ".join(owner_recent[-3:]) + ". ")
+            return (
+                f"{extra}"
+                "El chat lleva un rato callado y casave esta callado tambien. "
+                "Asked ONLY him, in one short sentence, what he is doing right now or "
+                "how it is going"
+                + (", and make it land with your usual humor. You may tease him a little."
+                   if chat_banter else ", plainly and warmly, no teasing, no jokes at his "
+                   "expense.")
+                + " Do NOT monologue, do NOT change topic, do NOT talk to the "
+                "chat. Just one short question to casave and stop. "
+                "Text only: no markdown, no lists, no emojis."
+            )
         if screen_attached:
             return self._screen_anchored_turn(
                 last_segment=last_segment,
@@ -591,14 +611,75 @@ class Persona:
         parts.append(f"{sentences_min}-{sentences_max} sentences. Your monologue only.")
         return "\n".join(parts)
 
-    def chat_turn(self, *, username: str, platform: str, text: str, is_highlight: bool) -> str:
+    def chat_turn(
+        self,
+        *,
+        username: str,
+        platform: str,
+        text: str,
+        is_highlight: bool,
+        is_first_time: bool = False,
+        is_owner: bool = False,
+        chat_banter: bool = True,
+    ) -> str:
         tag = " [HIGHLIGHT / super chat / donation / bits]" if is_highlight else ""
+        # chat.banter del perfil: con False Casavita NO tira de guasa ni
+        # bromas, responde seria. Antes estas reglas estaban fijas en el prompt
+        # y el interruptor del perfil no hacia nada.
+        reglas_banter = (
+            "BANTER RULES: you are allowed to roast the people in this chat, and to roast "
+            "casave himself, in a friendly way. A joke at someone's expense (including the "
+            "streamer's) is what makes the stream fun. Example: 'El juego est\u00e1 bueno, pero "
+            "casave es mal\u00edsimo jug\u00e1ndolo, yo le tengo fe, va a mejorar.' or 'El juego est\u00e1 "
+            "buen\u00edsimo, a ti te falta llegar a esos niveles.' Aim for one light jab per reply, "
+            "never cruel, never about appearance, personality, or anything real/offensive. "
+            "Then be nice right after, so nobody is left feeling bad.\n"
+            if chat_banter else
+            "NO BANTER: chat.banter is off in this profile. Be warm, useful and straight to "
+            "the point. NO roasting, NO jokes at anyone's expense (neither the chat nor "
+            "casave), no teasing, no picotazos. Answer what they actually asked, helpfully.\n"
+        )
+        bienvenida = ""
+        if is_first_time and is_owner:
+            bienvenida = (
+                f"\n{username} is the STREAMER (casave), the owner of this stream. "
+                f"Your first sentence must greet him warmly, like '\u00a1Hola {username}!', "
+                f"as if he just sat down at the mic. Do NOT say 'welcome to the stream' to "
+                f"him, he owns it. Then handle what he said.\n"
+            )
+        elif is_first_time:
+            plat = {
+                "twitch": "Twitch",
+                "youtube": "YouTube",
+                "tiktok": "TikTok",
+                "kick": "Kick",
+            }.get(platform, platform)
+            bienvenida = (
+                f"\nIMPORTANT: {username} has NEVER written before, and they are writing "
+                f"from {plat}. Your first sentence MUST welcome them by name AND say they "
+                f"arrived from {plat}, for example: 'Saludos, chui54, nos llega desde "
+                f"{plat}.' Mention the platform this ONE time only. Then handle what they "
+                f"said.\n"
+            )
         return (
             f"New chat message from {username} on {platform}{tag}:\n"
             f'"{text}"\n\n'
-            "Respond to it IN CHARACTER. Not as support, as the streamer. "
-            "React first, then answer if there's actually a question. "
-            "Keep it tight, keep it yours. Do not break the flow of the stream."
+            "You are the ASSISTANT and co-host of this stream. casave is the streamer, "
+            "not you. Support him, back him up, help the chat, keep things moving.\n"
+            f"{bienvenida}"
+            "PLAIN TEXT ONLY: never use asterisks, underscores, markdown of any kind, "
+            "emojis, or lists. Write exactly as spoken, with a full stop.\n"
+            f"{reglas_banter}"
+            "HOW TO ANSWER: your first sentence must name who is talking and say what "
+            f"they said or asked, but in YOUR OWN natural words, never reading the message "
+            f"out loud word for word. For example: '{username} dice que quiere saber mi opini\u00f3n "
+            f"del juego', or '{username} pregunta si tengo micr\u00f3fono'. Do NOT mention which "
+            f"platform they wrote from unless the instructions above told you to, and even "
+            f"then only once. Then answer that exact "
+            "message, in character, reacting to what they actually wrote. If you are not sure "
+            "about something they ask, say you are not sure instead of inventing it. "
+            "Keep it tight: one or two short sentences, no markdown, "
+            "no lists, no emojis. Do not break the flow of the stream."
         )
 
     def vision_turn(

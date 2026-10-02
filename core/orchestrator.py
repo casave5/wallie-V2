@@ -105,6 +105,7 @@ class Orchestrator:
         self._summarizer_task: Optional[asyncio.Task] = None
         self._recent_topics: list[str] = []
         self._last_chat_reply_ts = 0.0
+        self._ultimo_saludo_chat = 0.0
         self._current_topic: Optional[str] = None
         self._last_spoken: str = ""
         self._last_monologue_spoken: str = ""
@@ -119,6 +120,10 @@ class Orchestrator:
         self._goal_started_ts: float = 0.0
         self._recent_themes: list[str] = []
         self._phrase_uses: dict[str, int] = {}
+        # usernames ya vistos en el chat (para dar la bienvenida solo la primera vez)
+        self._chat_vistos: set[str] = set()
+        # últimas cosas que dijo casave, para mantener coherencia entre turnos
+        self._nota_dueno: list[str] = []
         self._segments_ended_with_question: int = 0
         # Only consumed for vision-intent segments, never monologue.
         self._latest_frame: Optional["VisionEvent"] = None
@@ -367,7 +372,8 @@ class Orchestrator:
             since_last_spoken = now_t - self._last_segment_spoken_ts
             since_last_vision = now_t - self._last_vision_turn_ts if self._last_vision_turn_ts > 0 else 9999.0
             hard_floor = self._cfg.vision.min_vision_react_interval_sec * 0.65
-            if (since_last_spoken >= self._target_silence_sec
+            if (self._cfg.vision.spontaneous_monologue
+                    and since_last_spoken >= self._target_silence_sec
                     and since_last_vision >= hard_floor
                     and self._mood.wants_vision_engagement() > 0.25):
                 roll = random.random()
@@ -481,7 +487,8 @@ class Orchestrator:
             since_last_vision = now_t - self._last_vision_turn_ts if self._last_vision_turn_ts > 0 else 9999.0
             hard_floor = vcfg.min_vision_react_interval_sec * 0.65
             if (
-                since_last_spoken >= self._target_silence_sec
+                vcfg.spontaneous_monologue
+                and since_last_spoken >= self._target_silence_sec
                 and since_last_vision >= hard_floor
                 and self._latest_frame is not None
                 and self._mood.wants_vision_engagement() > 0.3
@@ -533,6 +540,27 @@ class Orchestrator:
             return Intent(kind="monologue", vision_directive=VisionDirective(
                 reaction=VisionReaction.SILENCE, target_sentences=0,
                 rationale="hearing-mode: quiet, listening between reactions",
+            ))
+
+        if not self._cfg.vision.spontaneous_monologue:
+            # Aun muda por iniciativa propia, sí puede preguntarle a casave cada
+            # tanto ("¿qué haces ahora?") si el chat lleva rato callado.
+            ccfg = self._cfg.chat
+            if (
+                ccfg.check_in_probability > 0.0
+                and self._chat is not None
+                and time.time() - self._last_segment_spoken_ts >= ccfg.check_in_min_idle_sec
+                and random.random() < ccfg.check_in_probability
+            ):
+                return Intent(kind="monologue", vision_directive=VisionDirective(
+                    reaction=VisionReaction.TANGENT, target_sentences=1,
+                    rationale="check-in: preguntar a casave que esta haciendo",
+                ))
+            self._mood.on_silence_beat()
+            self._attention.on_silence_beat()
+            return Intent(kind="monologue", vision_directive=VisionDirective(
+                reaction=VisionReaction.SILENCE, target_sentences=0,
+                rationale="spontaneous_monologue off: callada hasta que le hablen",
             ))
 
         return Intent(kind="monologue")
@@ -722,11 +750,36 @@ class Orchestrator:
             drained.append(msg)
         highlight = next((m for m in drained if m.is_highlight), None)
         for m in drained:
+            self._avisar_saludo_chat(m)
             try:
                 self._chat.queue.put_nowait(m)
             except asyncio.QueueFull:
                 break
         return highlight
+
+    def _avisar_saludo_chat(self, msg: ChatMessage) -> None:
+        """Saluda con la mano si alguien escribe un saludo en el chat.
+
+        Se llama desde el peek, que ve todos los mensajes sin decidir si
+        Casavita contesta, asi que saluda tambien a los que no responden.
+        """
+        texto = (msg.text or "").strip().lower()
+        if not texto or len(texto) > 40:
+            return
+        limpio = re.sub(r"[^\w\s]", " ", texto, flags=re.UNICODE)
+        if not _SALUDO_CHAT.search(limpio):
+            return
+        ahora = time.monotonic()
+        if ahora - self._ultimo_saludo_chat < 4.0:
+            return
+        self._ultimo_saludo_chat = ahora
+        logger.info("saludo en el chat de %s: %s", msg.platform, msg.username)
+        try:
+            asyncio.get_running_loop().create_task(
+                self._avatar_safe_call("trigger_expression", "saludo")
+            )
+        except RuntimeError:
+            pass
 
     def _pop_highlight_chat(self) -> Optional[ChatMessage]:
         if not self._chat:
@@ -748,9 +801,29 @@ class Orchestrator:
                 break
         return found
 
+    def _usuarios_favoritos(self) -> set[str]:
+        """Nombres (en minúsculas, sin '@') que siempre reciben respuesta."""
+        return {
+            u.strip().lstrip("@").lower()
+            for u in (self._cfg.chat.always_reply_usernames or [])
+            if u and u.strip()
+        }
+
     def _pop_ordinary_chat(self) -> Optional[ChatMessage]:
         if not self._chat:
             return None
+        ahora = time.monotonic()
+        favoritos = self._usuarios_favoritos()
+        # El dueño del canal siempre entra primero y sin dados ni enfriamiento.
+        if favoritos and (ahora - self._last_chat_reply_ts) < self._cfg.chat.min_reply_interval_sec:
+            msg = self._chat.next_nowait()
+            if msg is None:
+                return None
+            if (msg.username or "").lower().lstrip("@") in favoritos:
+                logger.info(f"chat: {msg.username} (favorito) — respuesta siempre")
+                return msg
+            self._chat.queue.put_nowait(msg)
+
         now = time.time()
         if now - self._last_chat_reply_ts < self._cfg.chat.min_reply_interval_sec:
             return None
@@ -762,6 +835,9 @@ class Orchestrator:
             if now - msg.ts <= max_age:
                 break
             logger.debug(f"chat: dropping stale message from {msg.username} ({now - msg.ts:.0f}s old)")
+        if (msg.username or "").lower().lstrip("@") in favoritos:
+            logger.info(f"chat: {msg.username} (favorito) — respuesta siempre")
+            return msg
         if random.random() >= self._cfg.chat.reply_probability:
             return None
         return msg
@@ -1132,6 +1208,14 @@ class Orchestrator:
                     platform=intent.chat.platform,
                     text=intent.chat.text,
                 )
+                # Si es el dueño, su frase también es contexto del stream: queda
+                # guardada para que los próximos turnos conserven la coherencia.
+                if (intent.chat.username or "").lower().lstrip("@") in self._usuarios_favoritos():
+                    del self._nota_dueno[:-12]      # solo los 12 ultimos
+                    # Lo que dijo CASAVE (intent.chat.text), no `full`, que es
+                    # lo que Casavita esta diciendo: el prompt del check-in lo
+                    # lee como "Lo ultimo que dijo casave fue: ...".
+                    self._nota_dueno.append(intent.chat.text)
             self._mood.on_segment_spoken(length_chars=len(full))
             if is_fallback_vision:
                 self._attention.on_segment_spoken(intent_kind="monologue")
@@ -1218,12 +1302,9 @@ class Orchestrator:
             return
         await self._avatar_safe_call("set_speaking", True)
         try:
-            CHUNK = 1920 * 2  # ~40ms at 24 kHz mono PCM16
-            for i in range(0, len(audio), CHUNK):
-                piece = audio[i : i + CHUNK]
-                await self._player.write(piece)
-                if self._avatar:
-                    await self._avatar_safe_call("feed_audio", piece, self._tts.sample_rate)
+            await self._player.write(audio)
+            if self._avatar:
+                await self._avatar_safe_call("feed_audio", audio, self._tts.sample_rate)
         finally:
             self._player.boundary()
             await self._avatar_safe_call("set_speaking", False)
@@ -1273,12 +1354,30 @@ class Orchestrator:
     async def _build_user_turn(self, intent: Intent) -> tuple[str, list[ImageBlock], str]:
         if intent.kind == "chat" and intent.chat is not None:
             m = intent.chat
+            key = (m.username or "").strip().lstrip("@").lower()
+            es_dueno = key in self._usuarios_favoritos()
+            # La bienvenida se recuerda por plataforma: un "chui54" de TikTok y
+            # otro de YouTube son personas distintas. Sobrevive a los reinicios.
+            primera_vez = bool(key) and key not in self._chat_vistos
+            if self._memory is not None:
+                primera_vez = not self._memory.saludado_ya(m.platform, m.username)
+            if primera_vez:
+                if self._memory is not None:
+                    self._memory.marcar_saludado(m.platform, m.username)
+                if key:
+                    self._chat_vistos.add(key)
+                logger.info(
+                    f"chat: {m.username} en {m.platform}, primera vez (dueno={es_dueno})"
+                )
             return (
                 self._persona.chat_turn(
                     username=m.username,
                     platform=m.platform,
                     text=m.text,
                     is_highlight=m.is_highlight,
+                    is_first_time=primera_vez,
+                    is_owner=es_dueno,
+                    chat_banter=self._cfg.chat.banter,
                 ),
                 [],
                 f"chat:{m.platform}:{m.username}",
@@ -1362,9 +1461,22 @@ class Orchestrator:
                 topic_drift_style=self._cfg.topics.drift_style,
                 after_vision=self._last_intent_kind == "vision",
                 heard=self._fresh_heard(),
+                check_in=self._intento_es_checkin(intent),
+                owner_recent=list(self._nota_dueno) or None,
+                chat_banter=self._cfg.chat.banter,
             ),
             images,
             "monologue",
+        )
+
+    def _intento_es_checkin(self, intent: Intent) -> bool:
+        """True si este turno es una pregunta a casave, no monologueo."""
+        return (
+            not self._cfg.vision.spontaneous_monologue
+            and self._cfg.chat.check_in_probability > 0.0
+            and intent.vision_directive is not None
+            and intent.vision_directive.reaction == VisionReaction.TANGENT
+            and intent.vision_directive.target_sentences > 0
         )
 
     def _pick_next_topic(self) -> Optional[str]:
@@ -1587,6 +1699,39 @@ _STAGE_DIR = re.compile(
 _BOLD = re.compile(r"\*\*([^*\n]{1,80})\*\*")
 # Leftover formatting characters that shouldn't be voiced.
 _MD_CHARS = re.compile(r"[\*_`#>]")
+# Unicode that TTS engines mangle: emoji (and their ZWJ/variation-selector glue),
+# dingbats, arrows, box drawing and exotic spaces. Chat models emit these constantly
+# and Piper literally tries to pronounce them, which bloats a 2.5s line into 5.9s of
+# gibberish. Spanish punctuation (¡ ¿ ° …) and accented letters are preserved.
+_UNSPEAKABLE = re.compile(
+    "["
+    "ᄀ-ᅟ"                       # Hangul Jamo (LLaVA-style placeholder tokens)
+    "←-⇿"                  # arrows
+    "⌀-⏿"                  # misc technical + control pictures
+    "①-⓿"                  # circled alphanumerics
+    "■-◿"                  # geometric shapes
+    "☀-➿"                  # misc symbols + dingbats
+    "⬀-⯿"                  # misc symbols and arrows
+    "──-╿"                  # box drawing
+    "‌‍"                 # zero-width space / ZWNJ / ZWJ
+    "⁠-⁯"                  # other zero-width + word-joiner glue
+    "︎️"                     # variation selectors
+    "﻿"                               # BOM
+    "­"                               # soft hyphen
+    "\U0001f000-\U0001faff"    # emoji, pictographs, flags
+    "   -   　"    # exotic spaces
+    "]"
+)
+_PUNCT_GAP = re.compile(r"\s+([,.;:!?…])")
+
+# Saludo escrito en el chat: dispara el gesto de la mano. Solo palabras
+# sueltas, para no saludar por cualquier mensaje que las contenga.
+_SALUDO_PALABRAS = (
+    r"hola|holis|holaa|ola|buenas|buenos dias|buenas tardes|buenas noches"
+    r"|hey|hi|hello|casavita|todas|todos|amigos|everyone"
+    r"|saluda|saludo|saludos|adios|chao|chula|guapa|que tal|que onda|waves?|a"
+)
+_SALUDO_CHAT = re.compile(rf"^(?:{_SALUDO_PALABRAS})(?:\s+(?:{_SALUDO_PALABRAS}))*$", re.I)
 
 _EMOTION_PATTERNS: list[tuple[re.Pattern, str]] = [
     # Laughter — strongest, fire first.
@@ -1616,7 +1761,10 @@ def _scrub_unspeakable(text: str) -> str:
     text = _BOLD.sub(r"\1", text)
     text = _STAGE_DIR.sub("", text)
     text = _MD_CHARS.sub("", text)
-    return re.sub(r"\s+", " ", text).strip()
+    text = _UNSPEAKABLE.sub("", text)
+    text = re.sub(r"\s+", " ", text)
+    text = _PUNCT_GAP.sub(r"\1", text)
+    return text.strip()
 
 
 _BREAK_AFTER = {"and", "but", "which", "so", "because", "or", "though", "while", "until"}
