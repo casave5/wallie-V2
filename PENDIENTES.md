@@ -58,14 +58,24 @@ cd ~/wallie-V2 && .venv/bin/python -m pytest tests -q     # 46 tests
 
 ## 🔑 PARA CONTINUAR
 
-- **Arrancar/parar el avatar**:
+- **Arrancar TODO con una sola cosa** (ya NO hay autoinicio):
+  - Lanzador del menú: **Casavita** → enciende cerebro + voz + oído + avatar
+    (~7 s). Clic derecho en el icono → *Parar Casavita* / *Ver si está viva*.
+  - O en terminal: `casavita` · `casavita --parar` · `casavita --estado`
+    (script en `~/.local/bin/casavita`, icono propio en
+    `~/.local/share/icons/hicolor/*/apps/casavita.png`).
+  - El autoinicio está **desactivado a propósito**:
+    `~/.config/autostart/casavita-overlay.desktop.disabled` y
+    `wallie.service` + `avatar-web.service` con `systemctl --user disable`.
+    Para volver atrás: renombrar el `.disabled` y `systemctl --user enable`.
+- **Solo el avatar** (si el resto ya está encendido):
   - `~/casavita-escritorio.sh` → abrir · `--alto-avatar 900` → más alta
   - `~/casavita-escritorio.sh --capa` → a pantalla completa
   - `~/casavita-escritorio.sh --stop` → cerrar
 - **Servicio**: `systemctl --user restart wallie.service` (los logs van con
   `journalctl --user -u wallie -f`).
 - **Dashboard**: `http://127.0.0.1:8765` → Personality → Test chat reply.
-- **Código**: commit `e889b08`, ya subido a la fork `TU_USUARIO/wallie-V2`.
+- **Código**: todo en la fork `TU_USUARIO/wallie-V2` (la foto del estado actual está en `main`).
   - `origin` = repo del autor (solo para traerse novedades).
   - `fork` = el tuyo → `git push fork main`.
 - **LECCIÓN**: el HEAD del repo estaba muy desfasado. **No restaurar con git**:
