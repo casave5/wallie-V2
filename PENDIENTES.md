@@ -43,12 +43,20 @@
 
 ## ❌ LO QUE FALTA
 
-1. **Chat de Twitch de verdad.** El perfil tiene `twitch_enabled: true` pero
-   nunca se ha conectado: falta el **nombre del canal** y el **token OAuth**.
-   Mientras tanto no lee el chat de tu canal.
-2. **Prueba en vivo** con gente: ella + chat + stream a la vez.
+1. **Chat de Twitch: CONECTADO Y PROBADO** (2026-10-03). El canal es `tu_canal_twitch`
+   (sacado de la config de SocialStream Ninja) y va en
+   `~/.config/systemd/user/wallie.service.d/twitch.conf` → `TWITCH_CHANNEL=tu_canal_twitch`.
+   **Sin token**: Twitch acepta la lectura anónima, pero SOLO con nicks del tipo
+   `justinfan…` (con un nick inventado tipo `casavita1` dice
+   "Improperly formatted auth" y te echa). El usuario `tu_canal_twitch` está en
+   `always_reply_usernames`, así que sus mensajes siempre recibe respuesta.
+   Cada mensaje deja log: `chat twitch: usuario — texto`
+   (`chat/manager.py:next_nowait`, en INFO a propósito).
+2. **Prueba en vivo** con gente: ella + voz + avatar + chat a la vez.
 3. (Opcional) Encender `vision` para que vea la pantalla y `spontaneous_monologue`
-   para que hable sola. Ahora mismo está todo apagado a propósito.
+   para que hable sola. Ahora mismo está todo apagado a propósito. Con
+   `reply_probability: 1.0` contesta a TODO el chat: con mucho chat satura
+   (mínimo 8 s entre respuestas), se puede bajar.
 
 ## 🧪 TESTS
 
