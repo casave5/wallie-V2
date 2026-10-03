@@ -65,9 +65,14 @@ class ChatManager:
 
     def next_nowait(self) -> Optional[ChatMessage]:
         try:
-            return self.queue.get_nowait()
+            msg = self.queue.get_nowait()
         except asyncio.QueueEmpty:
             return None
+        # Una linea por mensaje: sin esto no hay forma de saber si el chat
+        # de Twitch esta llegando de verdad (a INFO, no a DEBUG, porque es lo
+        # que hay que mirar cuando "no me contesta al chat").
+        logger.info(f"chat {msg.platform}: {msg.username} — {msg.text}")
+        return msg
 
     def drain(self, max_items: int = 0) -> list[ChatMessage]:
         msgs: list[ChatMessage] = []
