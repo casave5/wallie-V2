@@ -21,13 +21,15 @@ import os
 import sys
 
 from PyQt6.QtCore import Qt, QUrl, QTimer
-from PyQt6.QtGui import QColor, QKeySequence, QShortcut
+from PyQt6.QtGui import QColor, QIcon, QKeySequence, QShortcut
 from PyQt6.QtWidgets import QApplication
 from PyQt6.QtWebEngineWidgets import QWebEngineView
 
 URL_BASE = "http://127.0.0.1:8100/"
 LOG = "/tmp/opencode/overlay.log"
 POSICION = os.path.expanduser("~/.config/casavita/posicion.json")
+ICONO_BARRA = os.path.expanduser(
+    "~/.local/share/icons/hicolor/256x256/apps/casavita-barra.png")
 
 # Cada cuanto se recuerda que la ventana va por delante. KWin la reapila al
 # maximizar otra ventana, y re-afirmarlo nosotros es mas fiable que pelearnos
@@ -76,6 +78,12 @@ class VentanaAvatar(QWebEngineView):
             flags |= Qt.WindowType.FramelessWindowHint
         self.setWindowFlags(flags)
         self.setWindowTitle("Casavita")
+
+        # Icono propio en la barra de tareas: KWin usa el del Widget, no el del
+        # .desktop del lanzador. Y DesktopFileName la agrupa con ese lanzador.
+        icono = QIcon(ICONO_BARRA)
+        if not icono.isNull():
+            self.setWindowIcon(icono)
 
         # Las dos cosas juntas hacen que WebEngine deje de pintar blanco:
         # fondo translucido en el widget + fondo transparente en la pagina.
