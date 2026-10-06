@@ -13,7 +13,7 @@ from chat import ChatManager
 from config import Runtime, get_runtime
 from core import Orchestrator, Persona, MemoryStore
 from config import PROFILES_DIR
-from llm import build_provider
+from llm import LLMProvider, build_provider, build_vision_provider
 from tts import build_tts
 
 
@@ -49,6 +49,18 @@ def build_orchestrator(runtime: Optional[Runtime] = None) -> Orchestrator:
 
     persona = Persona.from_config(cfg.persona)
     llm = build_provider(cfg.llm, runtime.secrets)
+    # Turns that carry a screenshot go to a second provider when one is configured:
+    # the chat model is chosen for snappy text and usually can't see anything.
+    vision_llm: Optional[LLMProvider] = None
+    if cfg.vision.enabled and cfg.llm.vision_provider:
+        try:
+            vision_llm = build_vision_provider(cfg.llm, runtime.secrets)
+            logger.info(
+                f"vision: turns con imagen van a {vision_llm.name}:{vision_llm.model} "
+                f"(el chat sigue en {llm.name}:{llm.model})"
+            )
+        except Exception as e:  # noqa: BLE001 — fall back to the chat provider
+            logger.error(f"vision: no se pudo crear el proveedor de vision ({e}); se usa el de texto")
     tts = build_tts(cfg.tts, runtime.secrets)
     player = AudioPlayer(sample_rate=tts.sample_rate, channels=tts.channels,
                          blocksize=int(getattr(cfg.tts, "blocksize", 0) or 4096),
@@ -62,8 +74,10 @@ def build_orchestrator(runtime: Optional[Runtime] = None) -> Orchestrator:
     vision_queue = None
     vision_loop = None
     if cfg.vision.enabled:
-        if not cfg.llm.vision_capable:
-            logger.warning("vision enabled but llm.vision_capable is False; disabling vision")
+        # Either the chat model itself can see, or a dedicated vision provider was
+        # configured to look at the screenshots.
+        if not (cfg.llm.vision_capable or cfg.llm.vision_provider):
+            logger.warning("vision enabled but no vision-capable model is configured; disabling vision")
         else:
             try:
                 from vision import VisionEvent, VisionLoop
@@ -127,6 +141,7 @@ def build_orchestrator(runtime: Optional[Runtime] = None) -> Orchestrator:
         chat_manager=chat_manager,
         vision_loop=vision_loop,
         vision_queue=vision_queue,
+        vision_llm=vision_llm,
         avatar=avatar,
         memory_store=memory_store,
         hearing_loop=hearing_loop,

@@ -93,6 +93,14 @@ llm:
   presence_penalty: 0.3
   frequency_penalty: 0.4
   vision_capable: false
+  # El modelo de texto (gpt-oss) no ve nada: los turnos que llevan captura van a
+  # este segundo proveedor, que si ve. El chat sigue yendo a Groq de arriba.
+  vision_provider: gemini
+  vision_model: gemini-flash-latest
+  # Se usa cuando Gemini se queda sin cuota (pasa seguido con el plan gratis):
+  # mismo modelo de vision pero servido por OpenRouter, tambien gratis.
+  vision_fallback_provider: openrouter
+  vision_fallback_model: dots-studio/dots-3-note-preview:free
   reasoning_effort: low
   allow_vision_skip: true
   ollama_base_url: http://localhost:11434
@@ -116,10 +124,12 @@ tts:
   kokoro_lang_code: a
   kokoro_speed: 1.0
 vision:
-  enabled: false
+  enabled: true
   source: monitor
   monitor_index: 1
-  interval_sec: 3.0
+  # En Wayland cada captura lanza spectacle y cuesta ~2s, asi que 3s seria un
+  # core entero quemado solo en esto. 10s da margen de sobra para ver cambios.
+  interval_sec: 10.0
   min_change_threshold: 8
   max_edge_px: 768
   llm_max_edge_px: 512
@@ -133,15 +143,15 @@ vision:
   organic_vision: false
   organicity: 0.75
   never_interrupt_speech: true
-  min_vision_react_interval_sec: 20.0
+  min_vision_react_interval_sec: 35.0
   micro_change_threshold: 4
   idle_check_interval_sec: 45.0
-  min_engagement_for_react: 0.35
+  min_engagement_for_react: 0.22
   startup_delay_sec: 5.0
   react_deep_base: 0.22
-  react_glance_base: 0.28
-  react_tangent_base: 0.05
-  react_ignore_base: 0.27
+  react_glance_base: 0.26
+  react_tangent_base: 0.08
+  react_ignore_base: 0.26
   react_silence_base: 0.18
   silence_fallback_scale: 12.0
   spontaneous_monologue: false
@@ -183,6 +193,15 @@ chat:
   max_message_age_sec: 45.0
   always_reply_usernames:
   - tu_canal_twitch
+  # Bots de alertas y overlays: nunca son personas, no se les contesta.
+  ignore_usernames:
+  - streamelements
+  - streamer.bot
+  - streamlabs
+  - nightbot
+  - filiabot
+  - coostbot
+  - moebot
   banter: true
   check_in_probability: 0.12
   check_in_min_idle_sec: 420.0

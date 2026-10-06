@@ -640,6 +640,17 @@ class Persona:
             "casave), no teasing, no picotazos. Answer what they actually asked, helpfully.\n"
         )
         bienvenida = ""
+        # En una plataforma que NO es el canal principal hay que decir de donde
+        # viene el mensaje cada vez: casave no ve los chats de los demas, asi que
+        # "juan dice que tal" le suena a cualquiera.
+        _PLAT = {
+            "twitch": "Twitch",
+            "youtube": "YouTube",
+            "tiktok": "TikTok",
+            "kick": "Kick",
+        }
+        plat_nombre = _PLAT.get(platform, platform)
+        de_donde = "" if platform == "twitch" else f" desde {plat_nombre}"
         if is_first_time and is_owner:
             bienvenida = (
                 f"\n{username} is the STREAMER (casave), the owner of this stream. "
@@ -648,18 +659,24 @@ class Persona:
                 f"him, he owns it. Then handle what he said.\n"
             )
         elif is_first_time:
-            plat = {
-                "twitch": "Twitch",
-                "youtube": "YouTube",
-                "tiktok": "TikTok",
-                "kick": "Kick",
-            }.get(platform, platform)
+            plat = plat_nombre
             bienvenida = (
-                f"\nIMPORTANT: {username} has NEVER written before, and they are writing "
-                f"from {plat}. Your first sentence MUST welcome them by name AND say they "
-                f"arrived from {plat}, for example: 'Saludos, chui54, nos llega desde "
-                f"{plat}.' Mention the platform this ONE time only. Then handle what they "
-                f"said.\n"
+                    f"\nIMPORTANT: {username} has NEVER written before, and they are writing "
+                    f"from {plat}. Your first sentence MUST welcome them by name AND say they "
+                    f"arrived from {plat}, for example: 'Saludos, chui54, nos llega desde "
+                    f"{plat}.' Mention the platform this ONE time only. Then handle what they "
+                    f"said.\n"
+                )
+        # En Kick/YouTube/TikTok hay que nombrar la plataforma en el parafraseo CADA
+        # vez (no solo la primera), porque casave no ve esos chats: si dices "juan
+        # dice que tal" a secas no sabe ni de quien ni de donde es.
+        regla_plataforma = ""
+        if de_donde:
+            regla_plataforma = (
+                f" You MUST say '{de_donde}' in your FIRST sentence, every single time, "
+                f"right after the name: '{username}{de_donde} dice que ...'. casave can "
+                f"only see the Twitch chat, so this is the only way he knows who is "
+                f"talking to you.\n"
             )
         return (
             f"New chat message from {username} on {platform}{tag}:\n"
@@ -670,17 +687,19 @@ class Persona:
             "PLAIN TEXT ONLY: never use asterisks, underscores, markdown of any kind, "
             "emojis, or lists. Write exactly as spoken, with a full stop.\n"
             f"{reglas_banter}"
+            f"{regla_plataforma}"
             "HOW TO ANSWER: your first sentence must name who is talking and say what "
             f"they said or asked, but in YOUR OWN natural words, never reading the message "
             f"out loud word for word. For example: '{username} dice que quiere saber mi opini\u00f3n "
             f"del juego', or '{username} pregunta si tengo micr\u00f3fono'. Do NOT mention which "
-            f"platform they wrote from unless the instructions above told you to, and even "
-            f"then only once. Then answer that exact "
+            f"platform they wrote from unless the instructions above told you to. Then "
+            f"answer that exact "
             "message, in character, reacting to what they actually wrote. If you are not sure "
             "about something they ask, say you are not sure instead of inventing it. "
             "Keep it tight: one or two short sentences, no markdown, "
             "no lists, no emojis. Do not break the flow of the stream."
         )
+
 
     def vision_turn(
         self,

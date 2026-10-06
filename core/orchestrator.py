@@ -3,6 +3,8 @@ from __future__ import annotations
 
 import asyncio
 import random
+import re
+import struct
 import time
 from collections import deque
 from dataclasses import dataclass
@@ -58,6 +60,7 @@ class Orchestrator:
         chat_manager: Optional[ChatManager] = None,
         vision_loop: Optional[VisionLoop] = None,
         vision_queue: Optional[asyncio.Queue[VisionEvent]] = None,
+        vision_llm: Optional["LLMProvider"] = None,
         avatar: Optional["VTubeStudioAvatar"] = None,
         memory_store: Optional[MemoryStore] = None,
         hearing_loop: Optional["HearingLoop"] = None,
@@ -72,6 +75,8 @@ class Orchestrator:
         self._chat = chat_manager
         self._vision_loop = vision_loop
         self._vision_queue = vision_queue
+        # Dedicated provider for turns that carry a screenshot; None = reuse self._llm.
+        self._vision_llm = vision_llm
         self._vision_ready_at: float = 0.0
         self._avatar = avatar
         self._memory = memory_store
@@ -106,6 +111,8 @@ class Orchestrator:
         self._recent_topics: list[str] = []
         self._last_chat_reply_ts = 0.0
         self._ultimo_saludo_chat = 0.0
+        # ultimo texto que escribimos en el chat de Twitch (para no spamear)
+        self._ultimo_eco_chat = 0.0
         self._current_topic: Optional[str] = None
         self._last_spoken: str = ""
         self._last_monologue_spoken: str = ""
@@ -211,6 +218,9 @@ class Orchestrator:
         self._highlights.stop()
         self._player.close()
         await self._llm.aclose()
+        if self._vision_llm is not None and self._vision_llm is not self._llm:
+            await self._vision_llm.aclose()
+
         await self._tts.aclose()
         if self._memory:
             self._memory.save()
@@ -227,6 +237,11 @@ class Orchestrator:
             "last_spoken": self._last_spoken[-300:] if self._last_spoken else "",
             "audio_queue_sec": round(self._player.seconds_queued(), 2),
             "llm": f"{self._llm.name}:{self._llm.model}",
+            "vision_llm": (
+                f"{self._vision_llm.name}:{self._vision_llm.model}"
+                if self._vision_llm is not None and self._vision_llm is not self._llm
+                else None
+            ),
             "tts": self._tts.name,
             "elapsed_sec": round(elapsed, 1),
             "remaining_sec": round(remaining_sec, 1) if remaining_sec is not None else None,
@@ -1023,9 +1038,15 @@ class Orchestrator:
             max_tok = min(max_tok, 220)
         elif intent.kind == "vision" and intent.vision_directive:
             _vision_tok_caps = {
-                VisionReaction.GLANCE: 100,
-                VisionReaction.DEEP: 200,
-                VisionReaction.TANGENT: 120,
+                # A vision model needs room to look before it answers, and 200 tokens
+                # was cutting her off mid-sentence on the deep reactions.
+                # These are ceilings, not targets: Gemini stops when it's done, but the
+                # OpenRouter fallback is a reasoning model that burns 400-600 tokens
+                # thinking before the first word, and anything under ~1000 came back
+                # empty (measured 0/3 at 500, 2/2 at 1000).
+                VisionReaction.GLANCE: 1000,
+                VisionReaction.DEEP: 1200,
+                VisionReaction.TANGENT: 1000,
             }
             max_tok = min(max_tok, _vision_tok_caps.get(
                 intent.vision_directive.reaction, 100))
@@ -1068,7 +1089,7 @@ class Orchestrator:
             first_seen = False
             capped = False
             try:
-                async for token in self._llm.stream(
+                async for token in self._llm_for(provider_msgs).stream(
                     provider_msgs,
                     temperature=self._cfg.llm.temperature,
                     top_p=self._cfg.llm.top_p,
@@ -1224,10 +1245,66 @@ class Orchestrator:
             self._last_segment_spoken_ts = time.time()
             self._target_silence_sec = self._compute_next_silence_target()
 
+            # Eco en el chat de Twitch: una vez por turno, al terminar, con el
+            # texto entero que acaba de decir en voz alta (a veces no se oye bien).
+            # Solo cuando esta contestando a alguien: si lo suelta en monologo
+            # visionado seria ruido en el canal.
+            if full and self._chat and intent.kind in ("chat", "hearing"):
+                # Para el chat solo va la respuesta: el "fulano dice que..." que
+                # dice por voz alta no lo quiere ahi, solo el aviso por si no se oye.
+                # Se manda a la MISMA plataforma de la que le hablaron: si le
+                # escriben en Kick, responde en Kick, no se cuela en Twitch.
+                _plataforma = intent.chat.platform if intent.kind == "chat" and intent.chat else ""
+                _quien = intent.chat.username if (intent.kind == "chat" and intent.chat) else ""
+                await self._eco_al_chat(full, _plataforma, _quien)
+
         if intent.kind == "monologue":
             if self._cfg.topics.mode == "list" and random.random() < self._cfg.topics.switch_chance:
                 if self._conv.session_seconds() >= self._cfg.topics.switch_min_sec:
                     self._current_topic = self._pick_next_topic()
+
+    async def _eco_al_chat(self, text: str, plataforma: str, username: str = "") -> None:
+        """Escribe en el chat lo que Casavita acaba de decir en voz alta.
+
+        Va a la MISMA plataforma de la que le hablaron: si alguien escribe en
+        Kick, la respuesta aparece en Kick y no se cuela en Twitch.
+
+        Se le quita el parafraseo inicial ("fulano dice que..."): en voz alta sirve
+        para que se entienda de quien habla la cosa, pero escrito en el chat es ruido.
+
+        Twitch corta los mensajes a 500 caracteres, y mandar medio dozen de lineas
+        seguidas dispara el rate limit de spam, asi que hay que podar y espaciar.
+        """
+        destino = (plataforma or "twitch").lower()
+        msg = _quitar_parafraseo(" ".join(text.split()), username)
+        if not msg:
+            return
+        if len(msg) > 480:
+            msg = msg[:477].rstrip() + "…"
+
+        now = time.monotonic()
+        if now - self._ultimo_eco_chat < 3.0:
+            logger.debug(f"{destino}: eco saltado, demasiado seguido")
+            return
+
+        for m in getattr(self._chat, "_monitors", []):
+            if getattr(m, "platform", "") != destino:
+                continue
+            # Sin permiso de escritura (p.ej. el monitor de Kick solo lee):
+            # se avisa en vez de fallar en silencio cada turno.
+            if not hasattr(m, "send_message"):
+                logger.warning(f"{destino}: este monitor no puede escribir (solo lectura)")
+                return
+            try:
+                await m.send_message(msg)
+            except Exception as e:
+                logger.warning(f"{destino}: no se pudo escribir en el chat: {e}")
+                return
+            # El reloj solo avanza si el mensaje se fue de verdad: si falla, no
+            # queremos que el reintento se coma el hueco del rate limit.
+            self._ultimo_eco_chat = time.monotonic()
+            return
+        logger.debug(f"{destino}: sin monitor activo, no se escribe")
 
     # ----- sentence preparation -----
     def _prepare_sentence(self, raw: str, *, allow_repeat: bool) -> list[str]:
@@ -1332,6 +1409,23 @@ class Orchestrator:
             logger.debug(f"avatar.{method} failed: {e}")
 
     # ----- image helpers -----
+    def _llm_for(self, messages: list[dict[str, Any]]) -> "LLMProvider":
+        """Pick the provider that can actually handle this turn.
+
+        The chat model is tuned for fast text; most of them reject a screenshot
+        outright ("content must be a string"). So if any message carries an image
+        block and a vision provider was configured, this turn goes there.
+        """
+        if self._vision_llm is None:
+            return self._llm
+        for m in messages:
+            content = m.get("content")
+            if isinstance(content, list) and any(
+                isinstance(b, dict) and b.get("type") == "image" for b in content
+            ):
+                return self._vision_llm
+        return self._llm
+
     async def _downscale_for_llm(self, jpeg_bytes: bytes) -> bytes:
         """Shrink frame for LLM to reduce upload size and processing time.
 
@@ -1688,8 +1782,6 @@ class Orchestrator:
 # ---------------------------------------------------------------------
 # Helpers
 # ---------------------------------------------------------------------
-import re
-import struct
 
 
 _STAGE_DIR = re.compile(
@@ -1757,6 +1849,61 @@ _EMOTION_PATTERNS: list[tuple[re.Pattern, str]] = [
 ]
 
 
+# Verbos con los que Casavita parafrasea lo que acaba de leer en el chat
+# ("fulano dice que...", "alguien agradece el animo..."). Lista amplia a
+# proposito: si un verbo falta, el parafraseo se queda (molesto pero inofensivo);
+# si sobra uno, se come el principio de su respuesta (peor).
+_PARAFRASEO = re.compile(
+    r"\b(?:dice|dijo|dice que|dijo que|dicen|diría|pregunta|preguntó|preguntan|"
+    r"pregunta que|preguntó que|pregunta si|preguntó si|pregunta por|"
+    r"quiere|quiso|quiere saber|quiere preguntar|quiere contar|quiere decir|"
+    r"agradece|agradeció|agradecido|agradezco|saluda|saludó|se presenta|"
+    r"está|esta|están|estaba|acaba de|acaba de escribir|acaba de preguntar|"
+    r"acaba de decir|acaba de saludar|ha dicho|ha preguntado|ha escrito|ha mandado|"
+    r"ha comentado|han dicho|menciona|comenta|comentó|cuenta|expone|indica|señala|"
+    r"avisa|pide|pidió|anuncia|comparte|confiesa|aclara|felicita|felicitó|"
+    r"nos dice|nos pregunta|nos cuenta)\b",
+    re.I,
+)
+# "fulano, ¿qué tal?" / "fulano te contesto" NO son parafraseo: le estan
+# hablando a el. Si el nombre va seguido de puntuacion o de un tratamiento, se
+# respeta la frase intacta.
+_AL_PARCELO = re.compile(r"[,;:!?¡¿]|\b(?:y|te|te|nos|va|vas|puedes|tu|tú|queremos)\b", re.I)
+
+
+def _quitar_parafraseo(texto: str, username: str) -> str:
+    """Quita la primera frase si solo repite lo que escribió el usuario.
+
+    El prompt le obliga a empezar reconociendo ("fulano dice que quiere saber X"), y en
+    voz alta eso ayuda, pero escrito en el chat es ruido: lo acaba de leer todo el
+    mundo. Solo se toca la PRIMERA frase y solo si empieza por el nombre del que
+    escribió con un verbo de parafraseo, asi que si lo que dice es su respuesta no
+    se toca nada.
+    """
+    nombre = (username or "").strip().lstrip("@")
+    if not nombre:
+        return texto
+    partes = re.split(r"(?<=[.!?…])\s+", texto.strip(), maxsplit=1)
+    if len(partes) < 2:
+        return texto  # una sola frase: mejor mandarla que dejar el chat mudo
+    primera, resto = partes
+    # Hasta dos palabras de relleno delante ("oye casave dice que..."). Los "_"
+    # del final del nick se permiten opcionales: ella escribe "casave" y el
+    # usuario de Twitch es "tu_canal_twitch".
+    nombre = re.escape(nombre.rstrip("_")) + r"_*"
+    m = re.match(rf"^((?:[\w'’]+\s+){{0,2}}@?{nombre}\b\s*)(\S+)?", primera, re.I)
+    if not m:
+        return texto
+    # Lo que va justo detras del nombre decide: si es puntuacion o un
+    # tratamiento, le esta hablando a el y la frase se queda entera.
+    if _AL_PARCELO.match(m.group(2) or ""):
+        return texto
+    if not _PARAFRASEO.search(primera):
+        return texto
+    return resto.strip()
+
+
+
 def _scrub_unspeakable(text: str) -> str:
     text = _BOLD.sub(r"\1", text)
     text = _STAGE_DIR.sub("", text)
@@ -1768,7 +1915,6 @@ def _scrub_unspeakable(text: str) -> str:
 
 
 _BREAK_AFTER = {"and", "but", "which", "so", "because", "or", "though", "while", "until"}
-
 
 def _split_run_on(sentence: str, max_words: int = 22) -> list[str]:
     """Safety net for run-on sentences the model spits out as one giant

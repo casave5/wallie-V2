@@ -42,9 +42,12 @@ class TwitchChatMonitor(ChatMonitor):
     async def _run(self, out: asyncio.Queue[ChatMessage]) -> None:
         import websockets
 
+        self._ws: Optional[websockets.WebSocketClientProtocol] = None
+
         while not self._stop_event.is_set():
             try:
                 async with websockets.connect(_IRC_WSS, open_timeout=10) as ws:
+                    self._ws = ws
                     await ws.send("CAP REQ :twitch.tv/tags twitch.tv/commands")
                     if self._oauth:
                         await ws.send(f"PASS {self._oauth}")
@@ -59,9 +62,20 @@ class TwitchChatMonitor(ChatMonitor):
                             if line.startswith("PING"):
                                 await ws.send(line.replace("PING", "PONG", 1))
                                 continue
+                            if "ERROR" in line:
+                                logger.error(f"twitch: server error received -> {line}")
+                                if "Login authentication failed" in line:
+                                    logger.error("twitch: AUTH FAILURE - Check OAuth token and Nick")
+                                continue
                             parsed = _parse_privmsg(line)
                             if parsed:
                                 user, text, is_bits = parsed
+                                # No nos re-leamos a nosotros mismos: lo que Casavita
+                                # escribe en el chat vuelve por aqui como un PRIVMSG
+                                # mas. Sin este filtro se responderia a si misma en
+                                # bucle infinito.
+                                if user.lower() == self._nick.lower():
+                                    continue
                                 try:
                                     out.put_nowait(ChatMessage(
                                         platform="twitch",
@@ -78,12 +92,32 @@ class TwitchChatMonitor(ChatMonitor):
                                     out.put_nowait(notice)
                                 except asyncio.QueueFull:
                                     pass
+
+                    self._ws = None
             except Exception as e:
+                self._ws = None
                 logger.warning(f"twitch: connection error: {e}, reconnecting in 5s")
                 try:
                     await asyncio.wait_for(self._stop_event.wait(), timeout=5.0)
                 except asyncio.TimeoutError:
                     pass
+
+    async def send_message(self, text: str) -> None:
+        """Send a message to the chat. Requires OAuth token."""
+        if not self._ws:
+            logger.warning("twitch: cannot send message, no active websocket")
+            return
+        if not self._oauth:
+            logger.warning("twitch: cannot send message, no oauth token configured")
+            return
+        try:
+            # IRC format: PRIVMSG #channel :message
+            msg = f"PRIVMSG #{self._channel} :{text}"
+            await self._ws.send(msg)
+            logger.info(f"twitch: sent message -> {text}")
+        except Exception as e:
+            logger.error(f"twitch: failed to send message: {e}")
+
 
 
 _HIGHLIGHT_NOTICE_IDS = {"sub", "resub", "subgift", "submysterygift", "raid"}

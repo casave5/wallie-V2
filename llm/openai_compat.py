@@ -30,6 +30,7 @@ class OpenAICompatProvider(LLMProvider):
         extra_headers: dict[str, str] | None = None,
         timeout: float = _REQUEST_TIMEOUT_SEC,
         reasoning_effort: str = "",
+        reasoning_transport: str = "flat",
     ) -> None:
         if not api_key:
             raise LLMError(f"{name}: missing API key")
@@ -44,6 +45,7 @@ class OpenAICompatProvider(LLMProvider):
         # Reasoning models (gpt-oss) spend max_tokens on hidden reasoning before the
         # answer. "low" keeps them snappy for a live stream; "" leaves it untouched.
         self._reasoning_effort = reasoning_effort or None
+        self._reasoning_transport = reasoning_transport
         self._base_url = base_url
         self._client = AsyncOpenAI(
             api_key=api_key,
@@ -64,9 +66,12 @@ class OpenAICompatProvider(LLMProvider):
         frequency_penalty: float = 0.0,
     ) -> AsyncIterator[str]:
         payload = [self._encode_message(m) for m in messages]
-        extra_body = (
-            {"reasoning_effort": self._reasoning_effort} if self._reasoning_effort else None
-        )
+        extra_body: dict[str, Any] | None = None
+        if self._reasoning_effort:
+            if self._reasoning_transport == "nested":
+                extra_body = {"reasoning": {"effort": self._reasoning_effort}}
+            else:
+                extra_body = {"reasoning_effort": self._reasoning_effort}
         last_err: Exception | None = None
         for attempt in range(_MAX_ATTEMPTS):
             produced = False

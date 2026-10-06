@@ -1,9 +1,15 @@
 """Provider factory — maps LLMConfig + Secrets to a concrete LLMProvider."""
 from __future__ import annotations
 
+import logging
+from typing import Any
+
 from config import LLMConfig, Secrets
 
+logger = logging.getLogger(__name__)
+
 from .base import LLMError, LLMProvider
+from .fallback import FallbackProvider
 
 
 def _missing_sdk(name: str, pkg: str) -> LLMError:
@@ -44,6 +50,8 @@ def build_provider(cfg: LLMConfig, secrets: Secrets) -> LLMProvider:
             api_key=secrets.openrouter_api_key,
             base_url="https://openrouter.ai/api/v1",
             supports_vision=cfg.vision_capable,
+            reasoning_effort=cfg.reasoning_effort,
+            reasoning_transport=cfg.reasoning_transport,
             extra_headers={
                 "HTTP-Referer": "https://github.com/wallie-ai/wallie",
                 "X-Title": "Wallie",
@@ -82,3 +90,47 @@ def build_provider(cfg: LLMConfig, secrets: Secrets) -> LLMProvider:
         )
 
     raise LLMError(f"Unknown LLM provider: {p}")
+
+
+def build_vision_provider(cfg: LLMConfig, secrets: Secrets) -> LLMProvider:
+    """Provider for turns that carry a screenshot.
+
+    Chains `vision_provider` then `vision_fallback_provider`, so an exhausted
+    free quota degrades to the next provider instead of losing the turn. Falls
+    back to the text provider when no dedicated vision one is configured, so a
+    setup with a multimodal chat model (or vision off) needs no extra config.
+    """
+    chain: list[LLMProvider] = []
+
+    for provider_name, model_name, is_fallback in (
+        (cfg.vision_provider, cfg.vision_model, False),
+        (cfg.vision_fallback_provider, cfg.vision_fallback_model, True),
+    ):
+        if not provider_name:
+            continue
+        extra: dict[str, Any] = {
+            "provider": provider_name,
+            "model": model_name or cfg.model,
+            # Whatever the text model is, the vision model is by definition
+            # asked to look at pictures.
+            "vision_capable": True,
+        }
+        if is_fallback and cfg.vision_fallback_model:
+            # The OpenRouter free tier only has heavy reasoning models left for
+            # vision. Asking for "low" keeps them from burning the whole token
+            # budget thinking and answering with nothing.
+            extra["reasoning_effort"] = cfg.vision_fallback_reasoning_effort
+            extra["reasoning_transport"] = "nested"
+        vis = cfg.model_copy(update=extra)
+        try:
+            chain.append(build_provider(vis, secrets))
+        except Exception as exc:  # noqa: BLE001 - e missing key must not kill vision
+            logger.warning(
+                "no se pudo preparar el proveedor de vision %s (%s)", provider_name, exc
+            )
+
+    if not chain:
+        return build_provider(cfg, secrets)
+    if len(chain) == 1:
+        return chain[0]
+    return FallbackProvider(chain)

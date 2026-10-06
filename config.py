@@ -136,9 +136,23 @@ class LLMConfig(BaseModel):
     presence_penalty: float = 0.3
     frequency_penalty: float = 0.4
     vision_capable: bool = False
+    # Most text models can't see, so a turn carrying a screenshot is routed to a
+    # SECOND provider instead of the chat one. Empty = use the same provider/model
+    # as the text turns (works when that model happens to be multimodal).
+    vision_provider: str = ""
+    vision_model: str = ""
+    # Tried when the vision provider above fails (usually: free quota exhausted).
+    # Same shape as vision_provider/vision_model, so several can be chained.
+    vision_fallback_provider: str = ""
+    vision_fallback_model: str = ""
+    # Reasoning budget for the fallback; "low" = answer instead of overthinking.
+    vision_fallback_reasoning_effort: str = "low"
     # Reasoning models (gpt-oss on Groq) hide a reasoning pass that eats max_tokens
     # and latency. "low" keeps a live stream snappy; "" sends nothing.
     reasoning_effort: str = ""
+    # "flat" sends reasoning_effort=<value> (OpenAI/Groq style); "nested" sends
+    # reasoning={"effort": <value>}, which OpenRouter's reasoning models need.
+    reasoning_transport: Literal["flat", "nested"] = "flat"
     allow_vision_skip: bool = True
     ollama_base_url: str = "http://localhost:11434"
     ollama_keep_alive: str = "5m"
@@ -282,6 +296,10 @@ class ChatConfig(BaseModel):
     # Users who ALWAYS get an answer, no dice roll and no cooldown. Case-insensitive,
     # without the leading '@'. This is the streamer talking to her in their own chat.
     always_reply_usernames: list[str] = []
+    # Users she must NEVER answer: alert/overlay bots (StreamElements, Streamer.bot,
+    # Nightbot...), and any account whose messages are not a real person talking.
+    # Case-insensitive, without the leading '@'.
+    ignore_usernames: list[str] = []
     # Light roasting is on/off. When on, she is allowed one friendly jab per reply,
     # aimed at chat AND at casave himself.
     banter: bool = True

@@ -101,9 +101,15 @@ def _parse_kick_event(raw: str) -> Optional[ChatMessage]:
     except json.JSONDecodeError:
         return None
     event = envelope.get("event", "")
+    # Pusher manda "data" como texto JSON en el protocolo viejo y ya
+    # deserializado en el nuevo: si se le pasa un dict a json.loads revienta
+    # con "the JSON object must be str, bytes or bytearray, not dict".
+    crudo = envelope.get("data", "{}")
     try:
-        data = json.loads(envelope.get("data", "{}"))
+        data = json.loads(crudo) if isinstance(crudo, (str, bytes, bytearray)) else crudo
     except json.JSONDecodeError:
+        return None
+    if not isinstance(data, dict):
         return None
     if event == "App\\Events\\ChatMessageEvent":
         user = data.get("sender", {}).get("username") or "viewer"

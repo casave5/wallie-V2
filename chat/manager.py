@@ -11,12 +11,25 @@ from config import ChatConfig, Secrets
 from .base import ChatMessage, ChatMonitor
 
 
+def _normaliza_nick(nick: str) -> str:
+    """Para comparar nicks de bots. Sin '@', en minusculas y sin puntos:
+    Streamer.bot a veces escribe "STREAMERBOT" y si no, se cuela."""
+    return nick.strip().lstrip("@").lower().replace(".", "")
+
+
 class ChatManager:
     def __init__(self, cfg: ChatConfig, secrets: Secrets) -> None:
         self._cfg = cfg
         self._secrets = secrets
         self.queue: asyncio.Queue[ChatMessage] = asyncio.Queue(maxsize=200)
         self._monitors: list[ChatMonitor] = []
+        # Bots de alertas y overlays: no son personas, asi que ni se loguean ni se
+        # contestan (si no, Casavita responde a "StreamElements haimilato 500 bits").
+        self._ignorados: set[str] = {
+            _normaliza_nick(u)
+            for u in (cfg.ignore_usernames or [])
+            if u and u.strip()
+        }
 
     async def start(self) -> None:
         if self._cfg.youtube_enabled:
@@ -64,15 +77,19 @@ class ChatManager:
         self._monitors.clear()
 
     def next_nowait(self) -> Optional[ChatMessage]:
-        try:
-            msg = self.queue.get_nowait()
-        except asyncio.QueueEmpty:
-            return None
-        # Una linea por mensaje: sin esto no hay forma de saber si el chat
-        # de Twitch esta llegando de verdad (a INFO, no a DEBUG, porque es lo
-        # que hay que mirar cuando "no me contesta al chat").
-        logger.info(f"chat {msg.platform}: {msg.username} — {msg.text}")
-        return msg
+        while True:
+            try:
+                msg = self.queue.get_nowait()
+            except asyncio.QueueEmpty:
+                return None
+            if _normaliza_nick(msg.username or "") in self._ignorados:
+                logger.debug(f"chat {msg.platform}: {msg.username} ignorado (bot)")
+                continue
+            # Una linea por mensaje: sin esto no hay forma de saber si el chat
+            # de Twitch esta llegando de verdad (a INFO, no a DEBUG, porque es lo
+            # que hay que mirar cuando "no me contesta al chat").
+            logger.info(f"chat {msg.platform}: {msg.username} — {msg.text}")
+            return msg
 
     def drain(self, max_items: int = 0) -> list[ChatMessage]:
         msgs: list[ChatMessage] = []
